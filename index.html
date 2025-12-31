@@ -1,0 +1,332 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Site PDF Crawler Controller</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg: #0f172a; /* slate-900 */
+      --card: #111827; /* gray-900 */
+      --muted: #9ca3af; /* gray-400 */
+      --accent: #3b82f6; /* blue-500 */
+      --ok: #10b981; /* emerald-500 */
+      --warn: #f59e0b; /* amber-500 */
+      --err: #ef4444; /* red-500 */
+    }
+    html, body { background: var(--bg); color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    .container { max-width: 980px; margin: 24px auto; padding: 0 16px; }
+    .card { background: var(--card); border: 1px solid #1f2937; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+    h1, h2 { margin: 0 0 12px; }
+    p { color: var(--muted); margin: 8px 0; }
+    label { display: block; margin: 10px 0 6px; color: #e5e7eb; }
+    input, select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151; background: #0b1020; color: #fff; }
+    input::placeholder { color: #6b7280; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    button { background: var(--accent); border: none; color: #fff; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
+    button.secondary { background: #374151; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status { display: inline-block; padding: 6px 10px; border-radius: 999px; font-size: 12px; }
+    .ok { background: #064e3b; color: var(--ok); }
+    .warn { background: #3f2d0f; color: var(--warn); }
+    .err { background: #3f1d1d; color: var(--err); }
+    .list { margin-top: 10px; }
+    .item { padding: 10px; border: 1px solid #1f2937; border-radius: 10px; margin-bottom: 10px; }
+    a { color: #93c5fd; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { background: #0b1020; padding: 2px 6px; border-radius: 6px; }
+    .small { font-size: 13px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>Site PDF Crawler</h1>
+      <p>Trigger a GitHub Actions workflow to crawl a site, print each page to PDF with <strong>timestamp + URL in header</strong>, then publish results on GitHub Pages (no page numbers).</p>
+      <p class="small">This page needs a GitHub Personal Access Token (PAT) to trigger the workflow and list published files. Your token is used in-memory only.</p>
+    </div>
+
+    <div class="card">
+      <h2>Repository & Auth</h2>
+      <div class="row">
+        <div>
+          <label>Owner (username or org)</label>
+          <input id="owner" placeholder="e.g., your-username">
+        </div>
+        <div>
+          <label>Repository name</label>
+          <input id="repo" placeholder="e.g., site-pdf-crawler">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Workflow file (in .github/workflows)</label>
+          <input id="workflowFile" value="crawl.yml">
+        </div>
+        <div>
+          <label>Default branch</label>
+          <input id="ref" value="main">
+        </div>
+      </div>
+      <label>GitHub Personal Access Token (PAT) <span class="small">(repo → workflow & contents read)</span></label>
+      <input id="token" type="password" placeholder="Paste token (not stored)">
+      <div style="margin-top: 12px;">
+        <button id="checkBtn" class="secondary">Check Access</button>
+        <span id="checkStatus" class="status warn">Not checked</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Run a Crawl</h2>
+      <label>Start URL</label>
+      <input id="startUrl" placeholder="https://example.com">
+      <div class="row">
+        <div>
+          <label>Max pages</label>
+          <input id="maxPages" type="number" value="50">
+        </div>
+        <div>
+          <label>Path prefix (optional)</label>
+          <input id="pathPrefix" placeholder="/docs">
+        </div>
+      </div>
+      <div style="margin-top: 12px;">
+        <button id="dispatchBtn">Trigger Workflow</button>
+        <span id="dispatchStatus" class="status warn">Idle</span>
+      </div>
+      <div id="runInfo" class="small" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>Published Runs (gh-pages)</h2>
+      <p class="small">Each run publishes to <code>https://OWNER.github.io/REPO/&lt;timestamp&gt;/</code>. Select a run to list its PDFs.</p>
+      <div style="margin-bottom:10px;">
+        <button id="refreshRuns" class="secondary">Refresh Runs</button>
+        <span id="runsStatus" class="status warn">Idle</span>
+      </div>
+      <div id="runsList" class="list"></div>
+      <div id="filesList" class="list"></div>
+    </div>
+  </div>
+
+  <script>
+    // --- Utility helpers ---
+    const $ = (id) => document.getElementById(id);
+    const delay = (ms) => new Promise(res => setTimeout(res, ms));
+
+    function ghHeaders(token) {
+      const h = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+      };
+      if (token) h["Authorization"] = "Bearer " + token;
+      return h;
+    }
+
+    async function checkAccess(owner, repo, token) {
+      // Try reading workflow list & gh-pages contents
+      try {
+        const wf = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows`, { headers: ghHeaders(token) });
+        if (!wf.ok) throw new Error(`Workflows list failed: ${wf.status}`);
+        const pages = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/?ref=gh-pages`, { headers: ghHeaders(token) });
+        // gh-pages might not exist yet; that's OK
+        $('checkStatus').textContent = wf.ok ? 'OK' : 'Error';
+        $('checkStatus').className = 'status ok';
+        return true;
+      } catch (e) {
+        $('checkStatus').textContent = 'Error';
+        $('checkStatus').className = 'status err';
+        console.error(e);
+        return false;
+      }
+    }
+
+    async function getWorkflowId(owner, repo, workflowFile, token) {
+      const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}`, { headers: ghHeaders(token) });
+      if (!r.ok) throw new Error(`Workflow ${workflowFile} not found: ${r.status}`);
+      const data = await r.json();
+      return data.id;
+    }
+
+    async function dispatchWorkflow(owner, repo, workflowFile, ref, inputs, token) {
+      const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/dispatches`;
+      const body = { ref, inputs };
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { ...ghHeaders(token), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (!r.ok) throw new Error(`Dispatch failed: ${r.status} ${await r.text()}`);
+      return true;
+    }
+
+    async function pollLatestRun(owner, repo, workflowId, token, timeoutMs = 10 * 60 * 1000) {
+      const start = Date.now();
+      $('dispatchStatus').textContent = 'Running...';
+      $('dispatchStatus').className = 'status warn';
+      while (Date.now() - start < timeoutMs) {
+        const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowId}/runs?per_page=5`, { headers: ghHeaders(token) });
+        if (!r.ok) throw new Error(`Runs fetch failed: ${r.status}`);
+        const data = await r.json();
+        const run = data.workflow_runs?.[0];
+        if (run) {
+          $('runInfo').innerHTML = `Workflow run: ${run.html_url}#${run.run_number}</a> — status: <strong>${run.status}</strong>, conclusion: <strong>${run.conclusion || '—'}</strong>`;
+          if (run.status === 'completed') {
+            if (run.conclusion === 'success') {
+              $('dispatchStatus').textContent = 'Success';
+              $('dispatchStatus').className = 'status ok';
+            } else {
+              $('dispatchStatus').textContent = 'Failed';
+              $('dispatchStatus').className = 'status err';
+            }
+            return run;
+          }
+        }
+        await delay(6000); // poll every 6s
+      }
+      $('dispatchStatus').textContent = 'Timeout';
+      $('dispatchStatus').className = 'status err';
+      return null;
+    }
+
+    async function listGhPagesRoot(owner, repo, token) {
+      const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/?ref=gh-pages`, { headers: ghHeaders(token) });
+      if (!r.ok) {
+        $('runsStatus').textContent = 'No gh-pages yet';
+        $('runsStatus').className = 'status warn';
+        return [];
+      }
+      const data = await r.json();
+      // Expect timestamped folders like 20250101-120000
+      const dirs = (data || []).filter(x => x.type === 'dir').map(x => x.name).sort().reverse();
+      return dirs;
+    }
+
+    async function listRunFiles(owner, repo, folder, token) {
+      const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${folder}?ref=gh-pages`, { headers: ghHeaders(token) });
+      if (!r.ok) throw new Error(`List files failed: ${r.status}`);
+      const data = await r.json();
+      return data || [];
+    }
+
+    function pagesBase(owner, repo) {
+      return `https://${owner}.github.io/${repo}`;
+    }
+
+    // --- Wire up UI ---
+    $('checkBtn').addEventListener('click', async () => {
+      const ok = await checkAccess($('owner').value.trim(), $('repo').value.trim(), $('token').value.trim());
+      if (ok) {
+        $('checkStatus').textContent = 'Access OK';
+        $('checkStatus').className = 'status ok';
+      }
+    });
+
+    $('dispatchBtn').addEventListener('click', async () => {
+      const owner = $('owner').value.trim();
+      const repo = $('repo').value.trim();
+      const token = $('token').value.trim();
+      const workflowFile = $('workflowFile').value.trim() || 'crawl.yml';
+      const ref = $('ref').value.trim() || 'main';
+      const startUrl = $('startUrl').value.trim();
+      const maxPages = $('maxPages').value.trim() || '50';
+      const pathPrefix = $('pathPrefix').value.trim() || '';
+
+      if (!owner || !repo || !token || !startUrl) {
+        alert('Owner, repo, token, and start URL are required.');
+        return;
+      }
+
+      $('dispatchStatus').textContent = 'Dispatching...';
+      $('dispatchStatus').className = 'status warn';
+      $('runInfo').textContent = '';
+
+      try {
+        const workflowId = await getWorkflowId(owner, repo, workflowFile, token);
+        await dispatchWorkflow(owner, repo, workflowFile, ref, {
+          start_url: startUrl,
+          max_pages: String(maxPages),
+          path_prefix: pathPrefix
+        }, token);
+
+        const run = await pollLatestRun(owner, repo, workflowId, token);
+        if (run && run.conclusion === 'success') {
+          $('dispatchStatus').textContent = 'Published to gh-pages';
+          $('dispatchStatus').className = 'status ok';
+          // Refresh run folders
+          await refreshRunsList();
+        }
+      } catch (e) {
+        console.error(e);
+        $('dispatchStatus').textContent = 'Error';
+        $('dispatchStatus').className = 'status err';
+        $('runInfo').textContent = String(e);
+      }
+    });
+
+    async function refreshRunsList() {
+      const owner = $('owner').value.trim();
+      const repo = $('repo').value.trim();
+      const token = $('token').value.trim();
+      $('runsStatus').textContent = 'Loading...';
+      $('runsStatus').className = 'status warn';
+      try {
+        const dirs = await listGhPagesRoot(owner, repo, token);
+        const base = pagesBase(owner, repo);
+        const listDiv = $('runsList');
+        listDiv.innerHTML = '';
+        if (!dirs.length) {
+          listDiv.innerHTML = '<div class="item">No published runs yet on gh-pages.</div>';
+        } else {
+          dirs.forEach(d => {
+            const el = document.createElement('div');
+            el.className = 'item';
+            el.innerHTML = `
+              <div><strong>${d}</strong> — <{base}/${d}/Open run</a> | <a href="${base}/${d}/crawl_log.csv.csv</a></div>
+              <div class="small">Click to list PDFs</div>
+            `;
+            el.addEventListener('click', async () => {
+              await refreshFilesList(d);
+            });
+            listDiv.appendChild(el);
+          });
+        }
+        $('runsStatus').textContent = 'Loaded';
+        $('runsStatus').className = 'status ok';
+      } catch (e) {
+        console.error(e);
+        $('runsStatus').textContent = 'Error';
+        $('runsStatus').className = 'status err';
+      }
+    }
+
+    async function refreshFilesList(folder) {
+      const owner = $('owner').value.trim();
+      const repo = $('repo').value.trim();
+      const token = $('token').value.trim();
+      const base = pagesBase(owner, repo);
+      $('filesList').innerHTML = '<div class="item">Loading files...</div>';
+      try {
+        const files = await listRunFiles(owner, repo, folder, token);
+        const pdfs = files.filter(f => f.type === 'file' && f.name.toLowerCase().endsWith('.pdf'));
+        const div = document.createElement('div');
+        div.className = 'item';
+        if (!pdfs.length) {
+          div.textContent = `No PDFs in ${folder}`;
+        } else {
+          div.innerHTML = `<div><strong>PDFs in ${folder}</strong></div>` +
+            pdfs.map(f => `<div>${base}/${folder}/${f.name}${f.name}</a></div>`).join('');
+        }
+        $('filesList').innerHTML = '';
+        $('filesList').appendChild(div);
+      } catch (e) {
+        console.error(e);
+        $('filesList').innerHTML = '<div class="item">Error listing run files.</div>';
+      }
+    }
+
+    $('refreshRuns').addEventListener('click', refreshRunsList);
+  </script>
+</body>
+</html>
